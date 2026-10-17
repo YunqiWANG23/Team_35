@@ -31,18 +31,18 @@ of that, we added a script that renders a **top-down 2D court video**.
   frame is warped through the inverse homography (image → reference court) onto a
   bird's-eye view of the court, and the reference court lines are drawn on top.
   The output video shows only this top-down view.
+- **Homography export** (`export_homography.py`, added by our team). It writes a
+  JSON file with one **image → court (metres)** matrix per frame.
+  `player_tracking` and `hit_detection` use it to place players on the court.
 
 **Not implemented yet (planned integration)**
 
-- Detecting players and mapping their positions to top-down court coordinates. The
-  top-down video warps the whole frame. It doesn't know where the players are.
-- Player trajectories and court heatmaps.
-- Exporting keypoints or homography matrices to a file. Right now they exist only
-  inside the scripts and are not saved.
+- Player trajectories and court heatmaps. Per-frame court positions are now
+  available from `player_tracking`, but nothing aggregates or draws them yet.
+- Exporting the 14 raw keypoints to a file.
 
 The homography in `homography.py` maps **reference court → image**.
-`infer_top_down_video.py` uses its inverse. Player mapping could reuse the same
-inverse once a player detector exists.
+`infer_top_down_video.py` and `export_homography.py` use its inverse.
 
 ---
 
@@ -56,6 +56,7 @@ court_calibration/
 ├── infer_in_video.py     # video inference entry point
 ├── infer_in_image.py     # single-image inference entry point
 ├── infer_top_down_video.py  # top-down 2D court video (our addition)
+├── export_homography.py     # per-frame image -> court (metres) matrices (our addition)
 ├── tracknet.py           # network definition (BallTrackerNet, 15 output channels)
 ├── postprocess.py        # heatmap → point extraction, keypoint refinement
 ├── homography.py         # homography selection between detected and reference points
@@ -201,6 +202,32 @@ How it differs from `infer_in_video.py`:
 - Frames where no court is found and the hold period has ended are written as black
   frames with only the court lines. At the end the script prints how many frames
   were detected, reused (held) or had no court.
+
+### Homography export (for player and hit analysis)
+
+```bash
+python export_homography.py --model_path weights/court_model.pt --input_path videos/match.mp4 --output_json output/court.json
+```
+
+This takes the same `--use_refine_kps`, `--max_error`, `--max_hold` and `--device`
+options as `infer_top_down_video.py`. The JSON contains `fps`, `width` and `height`,
+plus one entry per frame:
+
+```json
+{"frame": 0, "status": "detected", "reprojection_error": 3.1, "image_to_court": [[...], [...], [...]]}
+```
+
+- `image_to_court` maps a pixel `(x, y, 1)` of the **original video** to court
+  **metres** after dividing by the third component. It is `null` when no court is
+  available.
+- Court frame: x = 0 to 10.97 m across the court, starting at the far-left doubles
+  corner. y = 0 m at the far baseline to 23.77 m at the near baseline, with the net
+  at 11.885 m. "Far" and "left" are as seen from the camera.
+- `status` is `detected`, `held` (last good matrix reused) or `missing`.
+- Only valid for points **on the ground**, such as a player's feet or a ball bounce.
+  A ball in the air cannot be mapped this way.
+- Tested on synthetic data: the 14 reference keypoints mapped to their true court
+  positions in metres (for example, singles line at 1.37 m, service line at 5.49 m).
 
 ---
 
