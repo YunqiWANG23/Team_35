@@ -1,0 +1,16 @@
+
+# macOS
+.DS_Store
+
+# Python environments and cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Model weights and videos
+*.pt
+*.pth
+*.mp4
+*.avi
+*.mov
