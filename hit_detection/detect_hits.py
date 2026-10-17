@@ -2,7 +2,8 @@
 
 A frame becomes a hit when:
   1. the ball's image trajectory turns sharply, with the vertical image direction
-     reversing (towards / away from the camera), and
+     reversing (towards / away from the camera)  [trigger "turn"], or the ball
+     suddenly speeds up, e.g. a serve after a slow toss  [trigger "speedup"], and
   2. the ball is close to a tracked person at that moment.
 
 Each hit is assigned to the nearest person. If the player CSV contains court
@@ -52,8 +53,8 @@ def fill_short_gaps(xy, max_gap):
     return xy
 
 
-def direction_changes(xy, k, min_move, min_angle, require_vertical_reversal):
-    """ :return list of (frame, angle_deg) where the trajectory turns """
+def direction_changes(xy, k, min_move, min_angle, require_vertical_reversal, min_speedup):
+    """ :return list of candidate dicts {frame, angle, speed_ratio, out_speed (px/frame), trigger, score} """
     candidates = []
     for t in range(k, len(xy) - k):
         before = xy[t] - xy[t - k]
@@ -61,22 +62,28 @@ def direction_changes(xy, k, min_move, min_angle, require_vertical_reversal):
         if np.isnan(before).any() or np.isnan(after).any():
             continue
         nb, na = np.linalg.norm(before), np.linalg.norm(after)
-        if nb < min_move or na < min_move:
+        if na < min_move:
             continue
-        if require_vertical_reversal and before[1] * after[1] >= 0:
-            continue
-        angle = np.degrees(np.arccos(np.clip(np.dot(before, after) / (nb * na), -1.0, 1.0)))
-        if angle >= min_angle:
-            candidates.append((t, float(angle)))
+        ratio = na / max(nb, 0.5)
+        angle = 0.0
+        if nb >= min_move:
+            angle = float(np.degrees(np.arccos(np.clip(np.dot(before, after) / (nb * na), -1.0, 1.0))))
+        reversal = before[1] * after[1] < 0 or not require_vertical_reversal
+        if nb >= min_move and reversal and angle >= min_angle:
+            candidates.append({'frame': t, 'angle': angle, 'speed_ratio': float(ratio), 'out_speed': na / k,
+                               'trigger': 'turn', 'score': angle})
+        elif min_speedup > 0 and ratio >= min_speedup:
+            candidates.append({'frame': t, 'angle': angle, 'speed_ratio': float(ratio), 'out_speed': na / k,
+                               'trigger': 'speedup', 'score': min(30.0 * ratio, 180.0)})
     return candidates
 
 
 def non_max_suppression(candidates, min_gap):
     kept = []
-    for t, angle in sorted(candidates, key=lambda c: -c[1]):
-        if all(abs(t - k) >= min_gap for k, _ in kept):
-            kept.append((t, angle))
-    return sorted(kept)
+    for c in sorted(candidates, key=lambda c: -c['score']):
+        if all(abs(c['frame'] - k['frame']) >= min_gap for k in kept):
+            kept.append(c)
+    return sorted(kept, key=lambda c: c['frame'])
 
 
 def box_distance(px, py, row):
@@ -151,6 +158,11 @@ if __name__ == '__main__':
     parser.add_argument('--min_angle', type=float, default=45.0, help='min trajectory turn angle (degrees)')
     parser.add_argument('--any_turn', action='store_true',
                         help='accept turns without a vertical direction reversal (more bounce false positives)')
+    parser.add_argument('--min_speedup', type=float, default=2.5,
+                        help='also accept a hit when ball speed jumps by this factor (serves); 0 disables')
+    parser.add_argument('--min_out_speed', type=float, default=0.02,
+                        help='min outgoing ball speed in hitter box heights per frame; rejects e.g. the top '
+                             'of a serve toss')
     parser.add_argument('--min_gap_s', type=float, default=0.4, help='min time between two hits (seconds)')
     parser.add_argument('--reach', type=float, default=0.6,
                         help='max ball-to-box distance as a fraction of the box height')
@@ -172,13 +184,13 @@ if __name__ == '__main__':
     players_by_frame = {f: g for f, g in players.groupby('frame')}
     has_court = players['court_x_m'].notna().any()
 
-    candidates = direction_changes(ball_xy, args.window, args.min_move, args.min_angle, not args.any_turn)
-    candidates = non_max_suppression(candidates, max(1, int(round(args.min_gap_s * fps))))
-
-    hits, rejected = [], 0
-    for frame, angle in candidates:
-        bx, by = ball_xy[frame]
-        people = nearest_person(players_by_frame, frame, search=2)
+    candidates = direction_changes(ball_xy, args.window, args.min_move, args.min_angle, not args.any_turn,
+                                   args.min_speedup)
+    # attach the nearest person first, so rejected candidates cannot suppress real hits in NMS
+    accepted, rejected = [], {'no_player_nearby': 0, 'ball_too_slow': 0}
+    for cand in candidates:
+        bx, by = ball_xy[cand['frame']]
+        people = nearest_person(players_by_frame, cand['frame'], search=2)
         best = None
         if people is not None:
             for _, row in people.iterrows():
@@ -187,9 +199,18 @@ if __name__ == '__main__':
                 if dist <= args.reach and (best is None or dist < best[0]):
                     best = (dist, row, height)
         if best is None:
-            rejected += 1
-            continue
+            rejected['no_player_nearby'] += 1
+        elif cand['out_speed'] / best[2] < args.min_out_speed:
+            rejected['ball_too_slow'] += 1
+        else:
+            cand['best'] = best
+            accepted.append(cand)
+    accepted = non_max_suppression(accepted, max(1, int(round(args.min_gap_s * fps))))
 
+    hits = []
+    for cand in accepted:
+        frame, angle, best = cand['frame'], cand['angle'], cand['best']
+        bx, by = ball_xy[frame]
         dist, row, height = best
         hit = {
             'frame': frame,
@@ -197,7 +218,10 @@ if __name__ == '__main__':
             'track_id': int(row['track_id']),
             'ball_x': round(float(bx), 2),
             'ball_y': round(float(by), 2),
+            'trigger': cand['trigger'],
             'turn_angle_deg': round(angle, 1),
+            'speed_ratio': round(cand['speed_ratio'], 2),
+            'out_speed': round(cand['out_speed'] / best[2], 4),
             'ball_to_box': round(dist, 3),
             'ball_to_wrist': round(wrist_distance(bx, by, row) / height, 3),
             'wrist_speed': round(float(wrist_speed(players, row['track_id'], frame, height)), 4),
@@ -215,15 +239,16 @@ if __name__ == '__main__':
     out_dir = os.path.dirname(args.output_csv)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    columns = ['frame', 'time_s', 'track_id', 'ball_x', 'ball_y', 'turn_angle_deg', 'ball_to_box',
+    columns = ['frame', 'time_s', 'track_id', 'ball_x', 'ball_y', 'trigger', 'turn_angle_deg', 'speed_ratio',
+               'out_speed', 'ball_to_box',
                'ball_to_wrist', 'wrist_speed', 'ground_x', 'ground_y', 'court_x_m', 'court_y_m', 'side',
                'behind_baseline_m', 'depth_zone', 'lateral_zone']
     hits_df = pd.DataFrame(hits, columns=columns)
     hits_df.to_csv(args.output_csv, index=False)
 
     if args.summary_json:
-        summary = {'fps': round(fps, 3), 'trajectory_turns': len(candidates), 'hits': len(hits),
-                   'turns_without_player_nearby': rejected, 'players': {}}
+        summary = {'fps': round(fps, 3), 'candidate_frames': len(candidates), 'hits': len(hits),
+                   'rejected_candidate_frames': rejected, 'players': {}}
         for track_id, g in hits_df.groupby('track_id'):
             entry = {'hits': int(len(g)), 'hit_times_s': g['time_s'].tolist()}
             located = g[g['depth_zone'] != '']
@@ -239,6 +264,5 @@ if __name__ == '__main__':
         with open(args.summary_json, 'w') as f:
             json.dump(summary, f, indent=2)
 
-    print('Trajectory turns: {}, hits: {}, turns without a player nearby: {}'.format(
-        len(candidates), len(hits), rejected))
+    print('Candidate frames: {}, hits: {}, rejected frames: {}'.format(len(candidates), len(hits), rejected))
     print('Saved hits to {}'.format(args.output_csv))
